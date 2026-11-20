@@ -1,0 +1,87 @@
+name: Verify public action behind an IP allow list
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    # GitHub-hosted runner: whether its IP address is on the allow list of the
+    # organization which owns the action varies by runner, so the job runs
+    # several times. Each run uses one runner for both builds.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+    steps:
+      # Immutable public commit of the issue reproduction: its workflow uses
+      # aquasecurity/setup-trivy@v0.3.1 and `actions.lock` records it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: cloudpilot-ai/karpenter-provider-gcp
+          ref: c41e353a35200aef8f9a8d2a8e61016de8c9021d
+          path: target
+          persist-credentials: false
+      # https://github.com/github/gh-actions-lock/pull/275
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: dm3ch/gh-actions-lock
+          ref: ${{ vars.FIX_SHA || 'fix/ip-allowlist-public-fallback' }}
+          path: fix-src
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: fix-src/go.mod
+          cache: false
+      - name: Check access with an authenticated request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "### Runner IP: $(curl -s https://api.ipify.org)"
+            echo "Fix commit: $(git -C fix-src rev-parse HEAD)"
+            echo
+            echo '| Request | Authenticated | IP allow list refusal |'
+            echo '| :-- | :-- | :-- |'
+            repo=aquasecurity/setup-trivy
+            code=$(curl -s -o rest.json -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/commits/81e514348e19b6112ce2a7e3ecbafe19c1e1f567")
+            echo "| REST \`$repo\` | $code | $(grep -qs 'IP allow list' rest.json && echo YES || echo no) |"
+            query='{"query":"query{repository(owner:\"aquasecurity\",name:\"setup-trivy\"){nameWithOwner}}"}'
+            code=$(curl -s -o gql.json -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -d "$query" https://api.github.com/graphql)
+            echo "| GraphQL \`$repo\` | $code | $(grep -qs 'IP allow list' gql.json && echo YES || echo no) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Verify with the released gh-actions-lock v0.4.1
+        id: released
+        continue-on-error: true
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh extension install github/gh-actions-lock --pin v0.4.1
+          gh actions-lock --verify 2>&1 | tee "$RUNNER_TEMP/released.log"
+          exit "${PIPESTATUS[0]}"
+      # Same job, so the same runner IP address as the released build above.
+      - name: Verify with the fix
+        id: fix
+        continue-on-error: true
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd "$GITHUB_WORKSPACE/fix-src" && go build -o "$RUNNER_TEMP/gh-actions-lock-fix" ./cmd/gh-actions-lock)
+          "$RUNNER_TEMP/gh-actions-lock-fix" --verify 2>&1 | tee "$RUNNER_TEMP/fix.log"
+          exit "${PIPESTATUS[0]}"
+      - name: Summary
+        env:
+          RELEASED: ${{ steps.released.outcome }}
+          FIX: ${{ steps.fix.outcome }}
+        run: |
+          {
+            echo '### Result'
+            echo '| Build | Outcome |'
+            echo '| :-- | :-- |'
+            echo "| released v0.4.1 | $RELEASED |"
+            echo "| fix (PR 275) | $FIX |"
+            echo
+            echo '<details><summary>released output</summary>'; echo; echo '```'; cat "$RUNNER_TEMP/released.log"; echo '```'; echo '</details>'
+            echo '<details><summary>fix output</summary>'; echo; echo '```'; cat "$RUNNER_TEMP/fix.log"; echo '```'; echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
